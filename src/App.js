@@ -2,453 +2,357 @@ import { useState, useEffect, useCallback } from "react";
 
 const META_TOKEN = process.env.REACT_APP_META_TOKEN;
 const API = "https://graph.facebook.com/v19.0";
-const FIELDS = "name,amount_spent,budget_remaining,impressions,clicks,ctr,cpm,actions,action_values,reach";
 
 async function metaGet(path, params = {}) {
   const qs = new URLSearchParams({ access_token: META_TOKEN, ...params }).toString();
   const res = await fetch(`${API}${path}?${qs}`);
-  if (!res.ok) throw new Error(`Meta API error: ${res.status}`);
-  return res.json();
+  const json = await res.json();
+  if (json.error) throw new Error(json.error.message);
+  return json;
 }
 
-async function fetchAdAccounts() {
-  // Try /me/adaccounts first (user token), fall back to business accounts (system user token)
+async function fetchAllAccounts() {
+  const all = [];
   try {
-    const data = await metaGet("/me/adaccounts", { fields: "id,name,account_status,business", limit: 200 });
-    if (data.data && data.data.length > 0) return data.data;
-  } catch (e) { /* try next */ }
-
-  // System user: fetch all businesses then their ad accounts
+    const d = await metaGet("/me/adaccounts", { fields: "id,name,account_status,business", limit: 200 });
+    if (d.data?.length) all.push(...d.data);
+  } catch {}
   try {
-    const biz = await metaGet("/me/businesses", { fields: "id,name" });
-    if (biz.data && biz.data.length > 0) {
-      const allAccounts = [];
-      for (const b of biz.data) {
-        try {
-          const accs = await metaGet(`/${b.id}/owned_ad_accounts`, { fields: "id,name,account_status,business", limit: 200 });
-          if (accs.data) allAccounts.push(...accs.data.map(a => ({ ...a, business: { name: b.name } })));
-          const client = await metaGet(`/${b.id}/client_ad_accounts`, { fields: "id,name,account_status,business", limit: 200 });
-          if (client.data) allAccounts.push(...client.data.map(a => ({ ...a, business: { name: b.name } })));
-        } catch (e) { /* skip this business */ }
-      }
-      if (allAccounts.length > 0) return allAccounts;
+    const biz = await metaGet("/me/businesses", { fields: "id,name", limit: 50 });
+    for (const b of biz.data || []) {
+      try {
+        const owned = await metaGet(`/${b.id}/owned_ad_accounts`, { fields: "id,name,account_status,business", limit: 200 });
+        for (const a of owned.data || []) if (!all.find(x => x.id === a.id)) all.push({ ...a, business: { name: b.name } });
+      } catch {}
+      try {
+        const client = await metaGet(`/${b.id}/client_ad_accounts`, { fields: "id,name,account_status,business", limit: 200 });
+        for (const a of client.data || []) if (!all.find(x => x.id === a.id)) all.push({ ...a, business: { name: b.name } });
+      } catch {}
     }
-  } catch (e) { /* try next */ }
-
-  throw new Error("No ad accounts found. Check that your token has ads_read permission and accounts are assigned to this user/system user.");
+  } catch {}
+  return all;
 }
 
-async function fetchAccountInsights(accountId, datePreset) {
+async function fetchInsights(accountId, datePreset) {
   try {
-    const data = await metaGet(`/${accountId}/insights`, {
-      fields: FIELDS,
-      date_preset: datePreset,
-      level: "account",
-    });
-    return data.data?.[0] || null;
-  } catch {
-    return null;
-  }
+    const fields = "spend,impressions,clicks,ctr,cpm,actions,action_values,reach,frequency";
+    const d = await metaGet(`/${accountId}/insights`, { fields, date_preset: datePreset, level: "account" });
+    return d.data?.[0] || null;
+  } catch { return null; }
 }
 
-function extractLeads(actions) {
-  const a = (actions || []).find(x => x.action_type === "lead" || x.action_type === "offsite_conversion.lead");
-  return a ? parseInt(a.value) : 0;
+function getLeads(actions) {
+  return parseInt((actions || []).find(x => ["lead","offsite_conversion.lead","onsite_conversion.lead_grouped"].includes(x.action_type))?.value || 0);
+}
+function getRevenue(vals) {
+  return parseFloat((vals || []).find(x => ["purchase","offsite_conversion.fb_pixel_purchase"].includes(x.action_type))?.value || 0);
+}
+function getResults(actions) {
+  const priority = ["lead","offsite_conversion.lead","purchase","offsite_conversion.fb_pixel_purchase","complete_registration","subscribe"];
+  for (const p of priority) { const a = (actions||[]).find(x=>x.action_type===p); if (a) return {value: parseInt(a.value), type: p.split(".").pop().replace("fb_pixel_","").replace("offsite_conversion_","") }; }
+  const total = (actions||[]).reduce((s,a)=>s+parseInt(a.value||0),0);
+  return { value: total, type: "actions" };
 }
 
-function extractRevenue(action_values) {
-  const a = (action_values || []).find(x => x.action_type === "offsite_conversion.fb_pixel_purchase" || x.action_type === "purchase");
-  return a ? parseFloat(a.value) : 0;
-}
-
-const BM_NAMES = ["BM Alpha", "BM Beta", "BM Gamma", "BM Delta"];
-const MOCK_BUYERS = [
-  { id: 1, name: "Alex Rivera", avatar: "AR" },
-  { id: 2, name: "Jordan Kim", avatar: "JK" },
-  { id: 3, name: "Sam Patel", avatar: "SP" },
-  { id: 4, name: "Taylor Morgan", avatar: "TM" },
-  { id: 5, name: "Casey Chen", avatar: "CC" },
-  { id: 6, name: "Drew Williams", avatar: "DW" },
-  { id: 7, name: "Blake Johnson", avatar: "BJ" },
-];
-
-function generateMockAccounts(buyerId) {
-  const accounts = [];
-  for (let bm = 0; bm < 4; bm++) {
-    for (let acc = 0; acc < 5; acc++) {
-      const spend = Math.random() * 8000 + 500;
-      const budget = spend * (Math.random() * 0.6 + 1.1);
-      const revenue = spend * (Math.random() * 3 + 0.8);
-      const impressions = Math.floor(Math.random() * 900000 + 100000);
-      const clicks = Math.floor(impressions * (Math.random() * 0.04 + 0.01));
-      const leads = Math.floor(clicks * (Math.random() * 0.15 + 0.05));
-      const roas = revenue / spend;
-      accounts.push({
-        id: `${buyerId}-${bm}-${acc}`, bm: BM_NAMES[bm], bmIndex: bm,
-        name: `Account ${acc + 1}`, spend, budget, revenue, impressions, clicks, leads, roas,
-        ctr: (clicks / impressions) * 100, cpm: (spend / impressions) * 1000,
-        cpl: leads > 0 ? spend / leads : 0,
-        status: roas < 1.2 ? "poor" : roas < 2 ? "ok" : "good",
-      });
-    }
-  }
-  return accounts;
-}
-
-function fmt(n, type) {
-  if (isNaN(n) || n === null || n === undefined) return "—";
-  if (type === "currency") return "$" + Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
-  if (type === "pct") return Number(n).toFixed(2) + "%";
-  if (type === "x") return Number(n).toFixed(2) + "x";
-  if (type === "num") return Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
+function f(n, t) {
+  if (n === null || n === undefined || isNaN(n)) return "—";
+  n = Number(n);
+  if (t === "$") return n >= 1000 ? `$${(n/1000).toFixed(1)}k` : `$${n.toFixed(0)}`;
+  if (t === "%") return n.toFixed(2) + "%";
+  if (t === "x") return n.toFixed(2) + "x";
+  if (t === "n") return n >= 1000000 ? (n/1000000).toFixed(1)+"M" : n >= 1000 ? (n/1000).toFixed(1)+"k" : n.toLocaleString();
   return n;
 }
 
-function summarize(accounts) {
-  if (!accounts.length) return { spend: 0, budget: 0, revenue: 0, impressions: 0, clicks: 0, leads: 0, roas: 0, ctr: 0, cpm: 0, cpl: 0, budgetUsed: 0 };
-  const spend = accounts.reduce((s, a) => s + (a.spend || 0), 0);
-  const budget = accounts.reduce((s, a) => s + (a.budget || 0), 0);
-  const revenue = accounts.reduce((s, a) => s + (a.revenue || 0), 0);
-  const impressions = accounts.reduce((s, a) => s + (a.impressions || 0), 0);
-  const clicks = accounts.reduce((s, a) => s + (a.clicks || 0), 0);
-  const leads = accounts.reduce((s, a) => s + (a.leads || 0), 0);
-  return {
-    spend, budget, revenue, impressions, clicks, leads,
-    roas: spend > 0 ? revenue / spend : 0,
-    ctr: impressions > 0 ? (clicks / impressions) * 100 : 0,
-    cpm: impressions > 0 ? (spend / impressions) * 1000 : 0,
-    cpl: leads > 0 ? spend / leads : 0,
-    budgetUsed: budget > 0 ? (spend / budget) * 100 : 0,
-  };
-}
-
-const STATUS_COLOR = { good: "#00e5a0", ok: "#f5c542", poor: "#ff4d6d" };
-const STATUS_BG = { good: "rgba(0,229,160,0.1)", ok: "rgba(245,197,66,0.1)", poor: "rgba(255,77,109,0.1)" };
-const DATE_OPTIONS = [
-  { label: "Today", value: "today" },
-  { label: "Yesterday", value: "yesterday" },
-  { label: "Last 3d", value: "last_3d" },
-  { label: "Last 7d", value: "last_7d" },
-  { label: "Last 14d", value: "last_14d" },
-  { label: "Last 30d", value: "last_30d" },
-  { label: "This Month", value: "this_month" },
-  { label: "Last Month", value: "last_month" },
+const DATE_OPTS = [
+  { l: "Today", v: "today" }, { l: "Yesterday", v: "yesterday" },
+  { l: "7d", v: "last_7d" }, { l: "14d", v: "last_14d" },
+  { l: "30d", v: "last_30d" }, { l: "This Month", v: "this_month" },
+  { l: "Last Month", v: "last_month" },
 ];
 
+const MOCK = Array.from({ length: 14 }, (_, i) => {
+  const spend = Math.random() * 9000 + 200;
+  const budget = spend * (1.1 + Math.random() * 0.8);
+  const impr = Math.floor(Math.random() * 800000 + 20000);
+  const clicks = Math.floor(impr * (0.01 + Math.random() * 0.04));
+  const leads = Math.floor(clicks * (0.05 + Math.random() * 0.2));
+  const revenue = spend * (0.8 + Math.random() * 3.5);
+  const names = ["Rozana Marketplace K6","Rozana MP K9 Truliyo","Rozana MP 04 Truliyo","Rozana.in","Rozana MP K2 Kgtel","Rozana MP Ad Account","Rozana MP 01","Rozana MP K1 Saurabh","Rozana MP 02 PhotonX","Rozana MP K5 Hemant","Headrun Ads","Rozana MP K3 Alpha","Rozana MP K4 Beta","Rozana MP K7 Gamma"];
+  const bms = ["Rozana","Headrun Technologies","Karthik Bala's Business","Rozana MP"];
+  return {
+    id: `mock-${i}`, name: names[i] || `Account ${i+1}`,
+    bm: bms[i % 4], spend, budget, impr, clicks, leads, revenue,
+    ctr: (clicks/impr)*100, cpm: (spend/impr)*1000,
+    cpl: leads > 0 ? spend/leads : 0, roas: revenue/spend,
+    results: leads, resultType: "leads", status: "ACTIVE",
+  };
+});
+
 export default function App() {
-  const [allData, setAllData] = useState([]);
+  const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isLive, setIsLive] = useState(false);
-  const [selectedBuyer, setSelectedBuyer] = useState(null);
-  const [selectedBM, setSelectedBM] = useState(null);
-  const [sortKey, setSortKey] = useState("spend");
+  const [date, setDate] = useState("last_7d");
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState({ key: "spend", dir: -1 });
   const [lastUpdated, setLastUpdated] = useState(new Date());
-  const [pulse, setPulse] = useState(false);
-  const [datePreset, setDatePreset] = useState("last_7d");
 
-  const loadData = useCallback(async (preset) => {
-    const dp = preset || "last_7d";
+  const load = useCallback(async (dp) => {
     if (!META_TOKEN) {
-      setAllData(MOCK_BUYERS.map(b => ({ ...b, accounts: generateMockAccounts(b.id) })));
-      setIsLive(false); setLoading(false); return;
+      setAccounts(MOCK); setIsLive(false); setLoading(false); return;
     }
     try {
-      setError(null); setLoading(true);
-      const rawAccounts = await fetchAdAccounts();
-      const insightsArr = await Promise.all(rawAccounts.map(acc => fetchAccountInsights(acc.id, dp)));
-      const flatAccounts = rawAccounts.map((acc, i) => {
-        const ins = insightsArr[i];
-        const spend = ins ? parseFloat(ins.amount_spent || 0) : 0;
-        const budgetRemaining = ins ? parseFloat(ins.budget_remaining || 0) : 0;
-        const budget = spend + budgetRemaining;
-        const impressions = ins ? parseInt(ins.impressions || 0) : 0;
-        const clicks = ins ? parseInt(ins.clicks || 0) : 0;
-        const leads = ins ? extractLeads(ins.actions) : 0;
-        const revenue = ins ? extractRevenue(ins.action_values) : 0;
-        const roas = spend > 0 ? revenue / spend : 0;
+      setLoading(true); setError(null);
+      const raw = await fetchAllAccounts();
+      const insights = await Promise.all(raw.map(a => fetchInsights(a.id, dp)));
+      const mapped = raw.map((a, i) => {
+        const ins = insights[i];
+        const spend = parseFloat(ins?.spend || 0);
+        const impr = parseInt(ins?.impressions || 0);
+        const clicks = parseInt(ins?.clicks || 0);
+        const leads = getLeads(ins?.actions);
+        const revenue = getRevenue(ins?.action_values);
+        const res = getResults(ins?.actions);
         return {
-          id: acc.id, name: acc.name || `Account ${i + 1}`,
-          bm: acc.business?.name || BM_NAMES[i % 4], bmIndex: i % 4,
-          spend, budget, revenue, impressions, clicks, leads, roas,
-          ctr: impressions > 0 ? (clicks / impressions) * 100 : 0,
-          cpm: impressions > 0 ? (spend / impressions) * 1000 : 0,
+          id: a.id, name: a.name, bm: a.business?.name || "—",
+          spend, impr, clicks, leads, revenue,
+          ctr: parseFloat(ins?.ctr || 0),
+          cpm: parseFloat(ins?.cpm || 0),
           cpl: leads > 0 ? spend / leads : 0,
-          status: roas < 1.2 ? "poor" : roas < 2 ? "ok" : "good",
+          roas: spend > 0 ? revenue / spend : 0,
+          results: res.value, resultType: res.type,
+          status: a.account_status === 1 ? "ACTIVE" : "INACTIVE",
         };
       });
-      const buyers = MOCK_BUYERS.map((buyer, bi) => ({
-        ...buyer, accounts: flatAccounts.filter((_, i) => i % 7 === bi),
-      }));
-      setAllData(buyers); setIsLive(true); setLastUpdated(new Date());
-      setPulse(true); setTimeout(() => setPulse(false), 600);
+      setAccounts(mapped); setIsLive(true); setLastUpdated(new Date());
     } catch (e) {
-      setError(e.message);
-      setAllData(MOCK_BUYERS.map(b => ({ ...b, accounts: generateMockAccounts(b.id) })));
-      setIsLive(false);
+      setError(e.message); setAccounts(MOCK); setIsLive(false);
     } finally { setLoading(false); }
   }, []);
 
-  useEffect(() => { loadData(datePreset); }, [datePreset, loadData]);
-  useEffect(() => {
-    const interval = setInterval(() => loadData(datePreset), 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, [datePreset, loadData]);
+  useEffect(() => { load(date); }, [date, load]);
 
-  const activeBuyer = selectedBuyer !== null ? allData[selectedBuyer] : null;
-  const displayAccounts = activeBuyer
-    ? (selectedBM !== null ? activeBuyer.accounts.filter(a => a.bmIndex === selectedBM) : activeBuyer.accounts)
-    : null;
-  const sorted = displayAccounts ? [...displayAccounts].sort((a, b) => b[sortKey] - a[sortKey]) : null;
-  const globalStats = summarize(allData.flatMap(b => b.accounts));
+  const handleSort = (key) => setSort(s => ({ key, dir: s.key === key ? -s.dir : -1 }));
 
-  if (loading) return (
-    <div style={{ minHeight: "100vh", background: "#0a0c10", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', monospace" }}>
-      <div style={{ textAlign: "center" }}>
-        <div style={{ fontSize: 32, marginBottom: 16 }}>⚡</div>
-        <div style={{ color: "#00e5a0", fontSize: 13, letterSpacing: "3px" }}>LOADING MEDIA COMMAND...</div>
-        <div style={{ color: "#4a5068", fontSize: 11, marginTop: 8 }}>Fetching Meta Ads data</div>
-      </div>
-    </div>
+  const filtered = accounts
+    .filter(a => a.name.toLowerCase().includes(search.toLowerCase()) || a.bm.toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => (a[sort.key] > b[sort.key] ? 1 : -1) * sort.dir);
+
+  const totals = {
+    spend: accounts.reduce((s, a) => s + a.spend, 0),
+    impr: accounts.reduce((s, a) => s + a.impr, 0),
+    clicks: accounts.reduce((s, a) => s + a.clicks, 0),
+    results: accounts.reduce((s, a) => s + a.results, 0),
+    revenue: accounts.reduce((s, a) => s + a.revenue, 0),
+    ctr: accounts.reduce((s,a)=>s+a.impr,0) > 0 ? (accounts.reduce((s,a)=>s+a.clicks,0)/accounts.reduce((s,a)=>s+a.impr,0))*100 : 0,
+    cpm: accounts.reduce((s,a)=>s+a.impr,0) > 0 ? (accounts.reduce((s,a)=>s+a.spend,0)/accounts.reduce((s,a)=>s+a.impr,0))*1000 : 0,
+    roas: accounts.reduce((s,a)=>s+a.spend,0) > 0 ? accounts.reduce((s,a)=>s+a.revenue,0)/accounts.reduce((s,a)=>s+a.spend,0) : 0,
+    cpl: accounts.reduce((s,a)=>s+a.results,0) > 0 ? accounts.reduce((s,a)=>s+a.spend,0)/accounts.reduce((s,a)=>s+a.results,0) : 0,
+  };
+
+  const SortIcon = ({ k }) => (
+    <span style={{ marginLeft: 4, opacity: sort.key === k ? 1 : 0.3, fontSize: 10 }}>
+      {sort.key === k ? (sort.dir === -1 ? "↓" : "↑") : "↕"}
+    </span>
+  );
+
+  const TH = ({ label, k, right }) => (
+    <th onClick={() => handleSort(k)} style={{
+      padding: "10px 14px", fontSize: 11, fontWeight: 600, letterSpacing: "0.5px",
+      color: sort.key === k ? "#fff" : "#94a3b8", cursor: "pointer",
+      textAlign: right ? "right" : "left", whiteSpace: "nowrap",
+      borderBottom: "1px solid #1e293b", background: "#0f172a",
+      userSelect: "none",
+    }}>
+      {label}<SortIcon k={k} />
+    </th>
   );
 
   return (
-    <div style={{ minHeight: "100vh", background: "#0a0c10", color: "#e8eaf0", fontFamily: "'DM Mono', 'Courier New', monospace" }}>
+    <div style={{ minHeight: "100vh", background: "#080f1e", color: "#e2e8f0", fontFamily: "'IBM Plex Mono', monospace" }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@700;800&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Anybody:wght@700;900&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #0a0c10; } ::-webkit-scrollbar-thumb { background: #2a2d3a; border-radius: 2px; }
-        .buyer-card { transition: all 0.2s ease; cursor: pointer; } .buyer-card:hover { transform: translateY(-2px); }
-        .acc-row:hover { background: rgba(255,255,255,0.04) !important; }
-        .sort-btn, .date-btn { transition: all 0.15s ease; cursor: pointer; border: none; } .sort-btn:hover { color: #00e5a0; } .date-btn:hover { color: #fff !important; }
-        .pulse { animation: pulseAnim 0.6s ease; } @keyframes pulseAnim { 0%,100%{opacity:1} 50%{opacity:0.4} }
-        .live-dot { animation: blink 2s infinite; } @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-        .fade-in { animation: fadeIn 0.3s ease; } @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: #080f1e; }
+        ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+        tr.acc-row:hover td { background: #0f1f3d !important; }
+        tr.acc-row td { transition: background 0.12s; }
+        .date-pill { transition: all 0.15s; cursor: pointer; border: none; }
+        .date-pill:hover { background: rgba(99,179,237,0.12) !important; color: #93c5fd !important; }
+        .th-sort:hover { color: #fff !important; }
+        @keyframes fadeUp { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
+        .fade-up { animation: fadeUp 0.4s ease forwards; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+        .pulse { animation: pulse 1.5s infinite; }
+        input::placeholder { color: #334155; }
+        input:focus { outline: none; border-color: #3b82f6 !important; }
       `}</style>
 
-      {/* HEADER */}
-      <div style={{ background: "#0d0f15", borderBottom: "1px solid #1e2130", padding: "12px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <div style={{ background: "linear-gradient(135deg,#00e5a0,#0077ff)", width: 32, height: 32, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>⚡</div>
+      {/* TOP BAR */}
+      <div style={{ background: "#0a1628", borderBottom: "1px solid #1e293b", padding: "0 28px", display: "flex", alignItems: "center", justifyContent: "space-between", height: 56 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 30, height: 30, background: "linear-gradient(135deg, #3b82f6, #06b6d4)", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>📊</div>
           <div>
-            <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 17, fontWeight: 800, color: "#fff" }}>MEDIA COMMAND</div>
-            <div style={{ fontSize: 9, color: "#4a5068", letterSpacing: "2px" }}>META ADS · PERFORMANCE DASHBOARD</div>
+            <span style={{ fontFamily: "'Anybody', sans-serif", fontWeight: 900, fontSize: 16, color: "#fff", letterSpacing: "-0.5px" }}>ADSPEND</span>
+            <span style={{ fontSize: 10, color: "#334155", marginLeft: 8, letterSpacing: "2px" }}>TRACKER</span>
           </div>
         </div>
 
-        {/* DATE RANGE */}
-        <div style={{ display: "flex", alignItems: "center", gap: 3, background: "#0a0c10", border: "1px solid #1e2130", borderRadius: 8, padding: "4px 6px" }}>
-          {DATE_OPTIONS.map(opt => (
-            <button key={opt.value} className="date-btn" onClick={() => setDatePreset(opt.value)}
-              style={{
-                background: datePreset === opt.value ? "rgba(0,229,160,0.15)" : "transparent",
-                border: datePreset === opt.value ? "1px solid rgba(0,229,160,0.4)" : "1px solid transparent",
-                color: datePreset === opt.value ? "#00e5a0" : "#4a5068",
-                padding: "4px 9px", borderRadius: 5, fontSize: 10, fontFamily: "inherit",
-              }}>{opt.label}</button>
+        {/* DATE PILLS */}
+        <div style={{ display: "flex", gap: 3, background: "#0d1b2e", border: "1px solid #1e293b", borderRadius: 10, padding: "4px 5px" }}>
+          {DATE_OPTS.map(o => (
+            <button key={o.v} className="date-pill" onClick={() => setDate(o.v)} style={{
+              background: date === o.v ? "rgba(59,130,246,0.2)" : "transparent",
+              border: date === o.v ? "1px solid rgba(59,130,246,0.4)" : "1px solid transparent",
+              color: date === o.v ? "#93c5fd" : "#475569",
+              padding: "4px 11px", borderRadius: 6, fontSize: 11, fontFamily: "inherit",
+            }}>{o.l}</button>
           ))}
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          {error && <div style={{ fontSize: 10, color: "#ff4d6d", background: "rgba(255,77,109,0.1)", padding: "4px 10px", borderRadius: 5, maxWidth: 400, cursor: "pointer" }} title={error}>⚠ {error.length > 60 ? error.slice(0, 60) + "…" : error}</div>}
-          {!isLive && !error && <div style={{ fontSize: 10, color: "#f5c542", background: "rgba(245,197,66,0.1)", padding: "4px 10px", borderRadius: 5 }}>DEMO MODE</div>}
-          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#4a5068" }}>
-            <div className="live-dot" style={{ width: 6, height: 6, borderRadius: "50%", background: isLive ? "#00e5a0" : "#f5c542" }} />
-            {isLive ? "LIVE" : "DEMO"} · {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+          {error && <span style={{ fontSize: 10, color: "#f87171", background: "rgba(239,68,68,0.1)", padding: "3px 10px", borderRadius: 5 }} title={error}>⚠ {error.slice(0, 40)}…</span>}
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
+            <span className={loading ? "pulse" : ""} style={{ width: 7, height: 7, borderRadius: "50%", background: isLive ? "#22c55e" : "#f59e0b", display: "inline-block" }} />
+            <span style={{ color: "#475569" }}>{isLive ? "LIVE" : "DEMO"} · {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
           </div>
-          <button onClick={() => loadData(datePreset)} style={{ background: "rgba(0,229,160,0.08)", border: "1px solid rgba(0,229,160,0.2)", color: "#00e5a0", padding: "5px 12px", borderRadius: 6, fontSize: 10, fontFamily: "inherit", cursor: "pointer" }}>↺ REFRESH</button>
+          <button onClick={() => load(date)} style={{ background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.25)", color: "#60a5fa", padding: "5px 13px", borderRadius: 7, fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>↺ Refresh</button>
         </div>
       </div>
 
-      <div style={{ display: "flex", height: "calc(100vh - 65px)" }}>
-        {/* SIDEBAR */}
-        <div style={{ width: 215, background: "#0d0f15", borderRight: "1px solid #1e2130", padding: "18px 10px", overflowY: "auto", flexShrink: 0 }}>
-          <div style={{ fontSize: 9, letterSpacing: "2px", color: "#4a5068", marginBottom: 10, paddingLeft: 8 }}>MEDIA BUYERS</div>
-          <div className="buyer-card" onClick={() => { setSelectedBuyer(null); setSelectedBM(null); }}
-            style={{ padding: "10px 12px", borderRadius: 8, marginBottom: 4, background: selectedBuyer === null ? "rgba(0,229,160,0.1)" : "transparent", border: selectedBuyer === null ? "1px solid rgba(0,229,160,0.25)" : "1px solid transparent" }}>
-            <div style={{ fontSize: 11, fontWeight: 500, color: selectedBuyer === null ? "#00e5a0" : "#8890a8" }}>ALL BUYERS</div>
-            <div style={{ fontSize: 10, color: "#4a5068", marginTop: 2 }}>{allData.flatMap(b => b.accounts).length} accounts</div>
+      <div style={{ padding: "24px 28px" }}>
+
+        {/* SUMMARY STRIP */}
+        <div className="fade-up" style={{ display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: 10, marginBottom: 24 }}>
+          {[
+            { label: "TOTAL SPEND", value: f(totals.spend, "$"), accent: "#60a5fa" },
+            { label: "REVENUE", value: f(totals.revenue, "$"), accent: "#34d399" },
+            { label: "ROAS", value: f(totals.roas, "x"), accent: totals.roas >= 2 ? "#34d399" : totals.roas >= 1 ? "#fbbf24" : "#f87171" },
+            { label: "RESULTS", value: f(totals.results, "n"), accent: "#a78bfa" },
+            { label: "CPL", value: f(totals.cpl, "$"), accent: "#fb923c" },
+            { label: "IMPRESSIONS", value: f(totals.impr, "n"), accent: "#38bdf8" },
+            { label: "CLICKS", value: f(totals.clicks, "n"), accent: "#e2e8f0" },
+            { label: "CTR", value: f(totals.ctr, "%"), accent: "#fbbf24" },
+          ].map((c, i) => (
+            <div key={i} style={{ background: "#0a1628", border: "1px solid #1e293b", borderRadius: 10, padding: "13px 15px" }}>
+              <div style={{ fontSize: 9, color: "#334155", letterSpacing: "1.5px", marginBottom: 7 }}>{c.label}</div>
+              <div style={{ fontSize: 18, fontWeight: 600, color: c.accent, fontFamily: "'Anybody', sans-serif" }}>{c.value}</div>
+              <div style={{ fontSize: 9, color: "#1e3a5f", marginTop: 4 }}>{accounts.length} accounts</div>
+            </div>
+          ))}
+        </div>
+
+        {/* SEARCH + COUNT */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <input value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Search accounts or BM…"
+              style={{ background: "#0a1628", border: "1px solid #1e293b", color: "#e2e8f0", padding: "7px 14px", borderRadius: 8, fontSize: 12, fontFamily: "inherit", width: 260 }} />
+            {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 16 }}>×</button>}
           </div>
-          <div style={{ height: 1, background: "#1e2130", margin: "10px 0" }} />
-          {allData.map((buyer, i) => {
-            const s = summarize(buyer.accounts);
-            const isSel = selectedBuyer === i;
-            return (
-              <div key={buyer.id} className="buyer-card" onClick={() => { setSelectedBuyer(i); setSelectedBM(null); }}
-                style={{ padding: "10px 12px", borderRadius: 8, marginBottom: 4, background: isSel ? "rgba(0,229,160,0.08)" : "transparent", border: isSel ? "1px solid rgba(0,229,160,0.2)" : "1px solid transparent" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 5 }}>
-                  <div style={{ width: 26, height: 26, borderRadius: 6, background: isSel ? "linear-gradient(135deg,#00e5a0,#0077ff)" : "#1e2130", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: isSel ? "#000" : "#8890a8", flexShrink: 0 }}>{buyer.avatar}</div>
-                  <div style={{ fontSize: 11, fontWeight: 500, color: isSel ? "#fff" : "#8890a8", lineHeight: 1.2 }}>{buyer.name}</div>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10 }}>
-                  <span style={{ color: "#4a5068" }}>{fmt(s.spend, "currency")}</span>
-                  <span style={{ color: s.roas >= 2 ? "#00e5a0" : s.roas >= 1.2 ? "#f5c542" : "#ff4d6d" }}>{fmt(s.roas, "x")}</span>
-                </div>
-              </div>
-            );
-          })}
-          {activeBuyer && (
-            <>
-              <div style={{ height: 1, background: "#1e2130", margin: "10px 0" }} />
-              <div style={{ fontSize: 9, letterSpacing: "2px", color: "#4a5068", marginBottom: 8, paddingLeft: 8 }}>BUSINESS MANAGERS</div>
-              <div className="buyer-card" onClick={() => setSelectedBM(null)}
-                style={{ padding: "8px 12px", borderRadius: 6, marginBottom: 3, background: selectedBM === null ? "rgba(0,119,255,0.1)" : "transparent", border: selectedBM === null ? "1px solid rgba(0,119,255,0.25)" : "1px solid transparent", fontSize: 10, color: selectedBM === null ? "#4da6ff" : "#4a5068", cursor: "pointer" }}>ALL BMs</div>
-              {BM_NAMES.map((bm, i) => (
-                <div key={i} className="buyer-card" onClick={() => setSelectedBM(i)}
-                  style={{ padding: "8px 12px", borderRadius: 6, marginBottom: 3, background: selectedBM === i ? "rgba(0,119,255,0.1)" : "transparent", border: selectedBM === i ? "1px solid rgba(0,119,255,0.25)" : "1px solid transparent", fontSize: 10, color: selectedBM === i ? "#4da6ff" : "#4a5068", cursor: "pointer" }}>{bm}</div>
-              ))}
-            </>
+          <div style={{ fontSize: 11, color: "#334155" }}>
+            {filtered.length} of {accounts.length} accounts · {DATE_OPTS.find(d => d.v === date)?.l}
+          </div>
+        </div>
+
+        {/* TABLE */}
+        <div className="fade-up" style={{ background: "#0a1628", border: "1px solid #1e293b", borderRadius: 12, overflow: "hidden" }}>
+          {loading ? (
+            <div style={{ padding: 60, textAlign: "center" }}>
+              <div className="pulse" style={{ fontSize: 28, marginBottom: 12 }}>📊</div>
+              <div style={{ color: "#334155", fontSize: 12, letterSpacing: "2px" }}>FETCHING DATA…</div>
+            </div>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr>
+                    <TH label="#" k="name" />
+                    <TH label="ACCOUNT" k="name" />
+                    <TH label="BM" k="bm" />
+                    <TH label="SPEND" k="spend" right />
+                    <TH label="RESULTS" k="results" right />
+                    <TH label="CPL" k="cpl" right />
+                    <TH label="ROAS" k="roas" right />
+                    <TH label="IMPRESSIONS" k="impr" right />
+                    <TH label="CLICKS" k="clicks" right />
+                    <TH label="CTR" k="ctr" right />
+                    <TH label="CPM" k="cpm" right />
+                    <th style={{ padding: "10px 14px", fontSize: 11, color: "#334155", borderBottom: "1px solid #1e293b", background: "#0f172a", textAlign: "center" }}>STATUS</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {/* TOTALS ROW */}
+                  <tr style={{ borderBottom: "2px solid #1e3a5f" }}>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e" }} />
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", fontSize: 11, fontWeight: 600, color: "#60a5fa", letterSpacing: "1px" }}>TOTAL · {accounts.length} ACCOUNTS</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e" }} />
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: "#60a5fa" }}>{f(totals.spend, "$")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: "#a78bfa" }}>{f(totals.results, "n")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: "#fb923c" }}>{f(totals.cpl, "$")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: totals.roas >= 2 ? "#34d399" : totals.roas >= 1 ? "#fbbf24" : "#f87171" }}>{f(totals.roas, "x")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: "#38bdf8" }}>{f(totals.impr, "n")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: "#e2e8f0" }}>{f(totals.clicks, "n")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: "#fbbf24" }}>{f(totals.ctr, "%")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e", textAlign: "right", fontSize: 13, fontWeight: 600, color: "#e2e8f0" }}>{f(totals.cpm, "$")}</td>
+                    <td style={{ padding: "11px 14px", background: "#0d1b2e" }} />
+                  </tr>
+
+                  {filtered.length === 0 ? (
+                    <tr><td colSpan={12} style={{ padding: 40, textAlign: "center", color: "#334155", fontSize: 12 }}>No accounts match your search</td></tr>
+                  ) : filtered.map((acc, i) => {
+                    const isTop = i === 0 && sort.key === "spend" && sort.dir === -1;
+                    return (
+                      <tr key={acc.id} className="acc-row">
+                        <td style={{ padding: "11px 14px", fontSize: 11, color: "#334155", background: i % 2 === 0 ? "#0a1628" : "#0b1a30", width: 36 }}>{i + 1}</td>
+                        <td style={{ padding: "11px 14px", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            {isTop && <span style={{ fontSize: 10 }}>🔥</span>}
+                            <div>
+                              <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 500 }}>{acc.name}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td style={{ padding: "11px 14px", fontSize: 11, color: "#475569", background: i % 2 === 0 ? "#0a1628" : "#0b1a30", whiteSpace: "nowrap" }}>{acc.bm}</td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>
+                          <span style={{ fontSize: 13, fontWeight: 600, color: "#60a5fa" }}>{f(acc.spend, "$")}</span>
+                        </td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 5 }}>
+                            <span style={{ fontSize: 12, color: "#a78bfa" }}>{f(acc.results, "n")}</span>
+                            <span style={{ fontSize: 9, color: "#334155", textTransform: "uppercase" }}>{acc.resultType}</span>
+                          </div>
+                        </td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", fontSize: 12, color: "#fb923c", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>{f(acc.cpl, "$")}</td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>
+                          <span style={{ fontSize: 12, color: acc.roas >= 2 ? "#34d399" : acc.roas >= 1 ? "#fbbf24" : "#f87171", fontWeight: 600 }}>{f(acc.roas, "x")}</span>
+                        </td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", fontSize: 12, color: "#38bdf8", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>{f(acc.impr, "n")}</td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", fontSize: 12, color: "#e2e8f0", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>{f(acc.clicks, "n")}</td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", fontSize: 12, color: "#fbbf24", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>{f(acc.ctr, "%")}</td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", fontSize: 12, color: "#94a3b8", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>{f(acc.cpm, "$")}</td>
+                        <td style={{ padding: "11px 14px", textAlign: "center", background: i % 2 === 0 ? "#0a1628" : "#0b1a30" }}>
+                          <span style={{
+                            fontSize: 9, fontWeight: 600, letterSpacing: "1px", padding: "3px 8px", borderRadius: 4,
+                            background: acc.status === "ACTIVE" ? "rgba(34,197,94,0.1)" : "rgba(148,163,184,0.1)",
+                            color: acc.status === "ACTIVE" ? "#22c55e" : "#475569",
+                            border: `1px solid ${acc.status === "ACTIVE" ? "rgba(34,197,94,0.25)" : "rgba(148,163,184,0.15)"}`,
+                          }}>{acc.status}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
 
-        {/* MAIN */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "22px 26px" }}>
-          <div className="fade-in" style={{ marginBottom: 22 }}>
-            <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 22, fontWeight: 800, color: "#fff", letterSpacing: "-0.5px" }}>
-              {activeBuyer ? activeBuyer.name : "All Media Buyers"}
-              {selectedBM !== null && <span style={{ color: "#4da6ff", fontSize: 16 }}> · {BM_NAMES[selectedBM]}</span>}
-            </div>
-            <div style={{ fontSize: 11, color: "#4a5068", marginTop: 3 }}>
-              {activeBuyer ? `${displayAccounts.length} accounts · ${selectedBM !== null ? BM_NAMES[selectedBM] : "All BMs"}` : `${allData.length} buyers · ${allData.flatMap(b => b.accounts).length} accounts`}
-              <span style={{ marginLeft: 8, color: "#00e5a0" }}>· {DATE_OPTIONS.find(d => d.value === datePreset)?.label}</span>
-            </div>
-          </div>
-
-          {/* KPI CARDS */}
-          {(() => {
-            const s = activeBuyer ? summarize(displayAccounts) : globalStats;
-            return (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 26 }}>
-                {[
-                  { label: "TOTAL SPEND", value: fmt(s.spend, "currency"), sub: `of ${fmt(s.budget, "currency")} budget`, pct: s.budgetUsed, color: "#4da6ff" },
-                  { label: "REVENUE", value: fmt(s.revenue, "currency"), sub: `ROAS ${fmt(s.roas, "x")}`, color: s.roas >= 2 ? "#00e5a0" : s.roas >= 1.2 ? "#f5c542" : "#ff4d6d" },
-                  { label: "LEADS", value: fmt(s.leads, "num"), sub: `CPL ${fmt(s.cpl, "currency")}`, color: "#a78bfa" },
-                  { label: "CTR", value: fmt(s.ctr, "pct"), sub: `CPM ${fmt(s.cpm, "currency")}`, color: "#f5c542" },
-                  { label: "IMPRESSIONS", value: fmt(s.impressions / 1000, "num") + "K", sub: `${fmt(s.clicks, "num")} clicks`, color: "#ff8c42" },
-                ].map((c, i) => (
-                  <div key={i} className={pulse ? "pulse" : ""} style={{ background: "#0d0f15", border: "1px solid #1e2130", borderRadius: 12, padding: "15px 16px" }}>
-                    <div style={{ fontSize: 9, letterSpacing: "2px", color: "#4a5068", marginBottom: 7 }}>{c.label}</div>
-                    <div style={{ fontSize: 19, fontWeight: 500, color: c.color, fontFamily: "'Syne', sans-serif", letterSpacing: "-0.5px" }}>{c.value}</div>
-                    <div style={{ fontSize: 10, color: "#4a5068", marginTop: 3 }}>{c.sub}</div>
-                    {c.pct !== undefined && (
-                      <div style={{ marginTop: 7, background: "#1e2130", borderRadius: 4, height: 3, overflow: "hidden" }}>
-                        <div style={{ height: "100%", width: `${Math.min(c.pct || 0, 100)}%`, background: (c.pct || 0) > 90 ? "#ff4d6d" : "#4da6ff", borderRadius: 4, transition: "width 0.8s ease" }} />
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            );
-          })()}
-
-          {/* ALL BUYERS GRID */}
-          {!activeBuyer && (
-            <div className="fade-in">
-              <div style={{ fontSize: 9, letterSpacing: "2px", color: "#4a5068", marginBottom: 12 }}>BUYER PERFORMANCE GRID</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 10, marginBottom: 26 }}>
-                {allData.map((buyer, i) => {
-                  const s = summarize(buyer.accounts);
-                  return (
-                    <div key={i} className="buyer-card" onClick={() => setSelectedBuyer(i)}
-                      style={{ background: "#0d0f15", border: "1px solid #1e2130", borderRadius: 10, padding: "13px 11px" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 9 }}>
-                        <div style={{ width: 26, height: 26, borderRadius: 6, background: "#1e2130", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: "#8890a8" }}>{buyer.avatar}</div>
-                        <div style={{ fontSize: 10, color: "#fff" }}>{buyer.name.split(" ")[0]}</div>
-                      </div>
-                      {[
-                        { l: "Spend", v: fmt(s.spend, "currency"), c: "#4da6ff" },
-                        { l: "ROAS", v: fmt(s.roas, "x"), c: s.roas >= 2 ? "#00e5a0" : s.roas >= 1.2 ? "#f5c542" : "#ff4d6d" },
-                        { l: "Leads", v: fmt(s.leads, "num"), c: "#a78bfa" },
-                        { l: "CTR", v: fmt(s.ctr, "pct"), c: "#f5c542" },
-                      ].map((row, j) => (
-                        <div key={j} style={{ display: "flex", justifyContent: "space-between", fontSize: 10, marginBottom: 4 }}>
-                          <span style={{ color: "#4a5068" }}>{row.l}</span>
-                          <span style={{ color: row.c, fontWeight: 500 }}>{row.v}</span>
-                        </div>
-                      ))}
-                      <div style={{ marginTop: 7, background: "#1e2130", borderRadius: 4, height: 3, overflow: "hidden" }}>
-                        <div style={{ height: "100%", width: `${Math.min(s.budgetUsed || 0, 100)}%`, background: (s.budgetUsed || 0) > 90 ? "#ff4d6d" : "#4da6ff", borderRadius: 4 }} />
-                      </div>
-                      <div style={{ fontSize: 9, color: "#4a5068", marginTop: 3 }}>{fmt(s.budgetUsed, "pct")} budget used</div>
-                    </div>
-                  );
-                })}
-              </div>
-              <div style={{ fontSize: 9, letterSpacing: "2px", color: "#4a5068", marginBottom: 12 }}>BM BREAKDOWN · ALL BUYERS</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
-                {BM_NAMES.map((bm, bmIdx) => {
-                  const accs = allData.flatMap(b => b.accounts.filter(a => a.bmIndex === bmIdx));
-                  const s = summarize(accs);
-                  return (
-                    <div key={bmIdx} style={{ background: "#0d0f15", border: "1px solid #1e2130", borderRadius: 10, padding: "13px 15px" }}>
-                      <div style={{ fontSize: 11, color: "#4da6ff", fontWeight: 500, marginBottom: 9 }}>{bm}</div>
-                      {[
-                        { l: "Spend", v: fmt(s.spend, "currency") },
-                        { l: "Revenue", v: fmt(s.revenue, "currency") },
-                        { l: "ROAS", v: fmt(s.roas, "x"), c: s.roas >= 2 ? "#00e5a0" : s.roas >= 1.2 ? "#f5c542" : "#ff4d6d" },
-                        { l: "Leads", v: fmt(s.leads, "num") },
-                        { l: "CPL", v: fmt(s.cpl, "currency") },
-                        { l: "CTR", v: fmt(s.ctr, "pct") },
-                      ].map((row, j) => (
-                        <div key={j} style={{ display: "flex", justifyContent: "space-between", fontSize: 10, marginBottom: 5 }}>
-                          <span style={{ color: "#4a5068" }}>{row.l}</span>
-                          <span style={{ color: row.c || "#e8eaf0", fontWeight: 500 }}>{row.v}</span>
-                        </div>
-                      ))}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* ACCOUNT TABLE */}
-          {activeBuyer && sorted && (
-            <div className="fade-in">
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                <div style={{ fontSize: 9, letterSpacing: "2px", color: "#4a5068" }}>AD ACCOUNTS · {sorted.length} RESULTS</div>
-                <div style={{ display: "flex", gap: 5 }}>
-                  {["spend", "roas", "leads", "ctr", "cpm", "cpl"].map(k => (
-                    <button key={k} className="sort-btn" onClick={() => setSortKey(k)}
-                      style={{ background: sortKey === k ? "rgba(0,229,160,0.1)" : "transparent", border: sortKey === k ? "1px solid rgba(0,229,160,0.3)" : "1px solid #1e2130", color: sortKey === k ? "#00e5a0" : "#4a5068", padding: "4px 10px", borderRadius: 5, fontSize: 10, fontFamily: "inherit", textTransform: "uppercase" }}>{k}</button>
-                  ))}
-                </div>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "160px 110px 1fr 90px 90px 75px 75px 75px 75px 55px", padding: "8px 14px", background: "#0d0f15", borderRadius: "8px 8px 0 0", border: "1px solid #1e2130", borderBottom: "none" }}>
-                {["ACCOUNT", "BM", "BUDGET USE", "SPEND", "REVENUE", "ROAS", "CTR", "CPM", "CPL", "LEADS"].map((h, i) => (
-                  <div key={i} style={{ fontSize: 9, letterSpacing: "1.5px", color: "#4a5068", textAlign: i > 1 ? "right" : "left" }}>{h}</div>
-                ))}
-              </div>
-              <div style={{ border: "1px solid #1e2130", borderRadius: "0 0 8px 8px", overflow: "hidden" }}>
-                {sorted.map((acc, i) => {
-                  const bp = acc.budget > 0 ? (acc.spend / acc.budget) * 100 : 0;
-                  return (
-                    <div key={acc.id} className="acc-row" style={{ display: "grid", gridTemplateColumns: "160px 110px 1fr 90px 90px 75px 75px 75px 75px 55px", padding: "10px 14px", background: i % 2 === 0 ? "transparent" : "rgba(255,255,255,0.01)", borderBottom: i < sorted.length - 1 ? "1px solid #1e2130" : "none", alignItems: "center" }}>
-                      <div style={{ fontSize: 11, color: "#e8eaf0" }}>{acc.name}</div>
-                      <div style={{ fontSize: 10, color: "#4a5068" }}>{acc.bm}</div>
-                      <div style={{ paddingRight: 14 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#4a5068", marginBottom: 3 }}>
-                          <span>{fmt(acc.spend, "currency")}</span><span>{fmt(bp, "pct")}</span>
-                        </div>
-                        <div style={{ background: "#1e2130", borderRadius: 3, height: 4, overflow: "hidden" }}>
-                          <div style={{ height: "100%", width: `${Math.min(bp, 100)}%`, background: bp > 90 ? "#ff4d6d" : bp > 70 ? "#f5c542" : "#4da6ff", borderRadius: 3 }} />
-                        </div>
-                      </div>
-                      <div style={{ textAlign: "right", fontSize: 11, color: "#4da6ff" }}>{fmt(acc.spend, "currency")}</div>
-                      <div style={{ textAlign: "right", fontSize: 11, color: "#e8eaf0" }}>{fmt(acc.revenue, "currency")}</div>
-                      <div style={{ textAlign: "right", fontSize: 11, color: STATUS_COLOR[acc.status], fontWeight: 500 }}>{fmt(acc.roas, "x")}</div>
-                      <div style={{ textAlign: "right", fontSize: 11, color: "#f5c542" }}>{fmt(acc.ctr, "pct")}</div>
-                      <div style={{ textAlign: "right", fontSize: 11, color: "#e8eaf0" }}>{fmt(acc.cpm, "currency")}</div>
-                      <div style={{ textAlign: "right", fontSize: 11, color: "#e8eaf0" }}>{fmt(acc.cpl, "currency")}</div>
-                      <div style={{ textAlign: "right" }}>
-                        <span style={{ background: STATUS_BG[acc.status], color: STATUS_COLOR[acc.status], padding: "2px 6px", borderRadius: 4, fontSize: 9, fontWeight: 500 }}>{fmt(acc.leads, "num")}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
+        <div style={{ marginTop: 12, fontSize: 10, color: "#1e3a5f", textAlign: "right" }}>
+          Auto-refreshes every 5 min · {isLive ? "Connected to Meta Ads API" : "Running in demo mode — add REACT_APP_META_TOKEN to go live"}
         </div>
       </div>
     </div>
