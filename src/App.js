@@ -12,8 +12,30 @@ async function metaGet(path, params = {}) {
 }
 
 async function fetchAdAccounts() {
-  const data = await metaGet("/me/adaccounts", { fields: "id,name,account_status,business" });
-  return data.data || [];
+  // Try /me/adaccounts first (user token), fall back to business accounts (system user token)
+  try {
+    const data = await metaGet("/me/adaccounts", { fields: "id,name,account_status,business", limit: 200 });
+    if (data.data && data.data.length > 0) return data.data;
+  } catch (e) { /* try next */ }
+
+  // System user: fetch all businesses then their ad accounts
+  try {
+    const biz = await metaGet("/me/businesses", { fields: "id,name" });
+    if (biz.data && biz.data.length > 0) {
+      const allAccounts = [];
+      for (const b of biz.data) {
+        try {
+          const accs = await metaGet(`/${b.id}/owned_ad_accounts`, { fields: "id,name,account_status,business", limit: 200 });
+          if (accs.data) allAccounts.push(...accs.data.map(a => ({ ...a, business: { name: b.name } })));
+          const client = await metaGet(`/${b.id}/client_ad_accounts`, { fields: "id,name,account_status,business", limit: 200 });
+          if (client.data) allAccounts.push(...client.data.map(a => ({ ...a, business: { name: b.name } })));
+        } catch (e) { /* skip this business */ }
+      }
+      if (allAccounts.length > 0) return allAccounts;
+    }
+  } catch (e) { /* try next */ }
+
+  throw new Error("No ad accounts found. Check that your token has ads_read permission and accounts are assigned to this user/system user.");
 }
 
 async function fetchAccountInsights(accountId, datePreset) {
@@ -228,7 +250,7 @@ export default function App() {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          {error && <div style={{ fontSize: 10, color: "#ff4d6d", background: "rgba(255,77,109,0.1)", padding: "4px 10px", borderRadius: 5 }}>⚠ API Error — demo data</div>}
+          {error && <div style={{ fontSize: 10, color: "#ff4d6d", background: "rgba(255,77,109,0.1)", padding: "4px 10px", borderRadius: 5, maxWidth: 400, cursor: "pointer" }} title={error}>⚠ {error.length > 60 ? error.slice(0, 60) + "…" : error}</div>}
           {!isLive && !error && <div style={{ fontSize: 10, color: "#f5c542", background: "rgba(245,197,66,0.1)", padding: "4px 10px", borderRadius: 5 }}>DEMO MODE</div>}
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#4a5068" }}>
             <div className="live-dot" style={{ width: 6, height: 6, borderRadius: "50%", background: isLive ? "#00e5a0" : "#f5c542" }} />
